@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .codeevolver.lock
+env/
+.venv/
+.codeevolver/
