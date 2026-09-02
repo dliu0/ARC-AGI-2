@@ -1,24 +1,34 @@
-import os
 import json
-import litellm
+import re
+
+# Provider wiring -- the pinned model, the provider preference order, the
+# per-call cross-provider divert, the health flag and the streaming hang guard
+from src.infra.lm_provider import build_task_lm
+
+try:  
+    from ._tracing import traceable
+except ImportError:  # loaded as a top-level module rather than a package member
+    from _tracing import traceable
+
+try:
+    from opentelemetry import trace as _otel_trace
+except Exception:  
+    _otel_trace = None
+
+try:
+    from openinference.instrumentation.litellm import LiteLLMInstrumentor
+    LiteLLMInstrumentor().instrument()
+except Exception:  
+    pass
 
 
-class _NoOpSpan:
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): return False
-    def set_attribute(self, *args, **kwargs): return None
-
-
-class _NoOpTracer:
-    def start_as_current_span(self, name, *args, **kwargs): return _NoOpSpan()
-
-
-# Deliberately a no-op rather than a real OTLP exporter. The arc-agi (v1) seed
-# imports opentelemetry.exporter.otlp, which makes the OTLP/HTTP exporter a HARD
-# requirement of its benchmark image -- omit it there and the mounted evaluator
-# dies on ModuleNotFoundError before the first iteration. Keeping v2 free of
-# that import is why requirements.txt here is just litellm + tenacity.
-tracer = _NoOpTracer()
+def _set_span_attr(key, value):
+    """Attach an extra attribute to the span @traceable already opened."""
+    if _otel_trace is None:
+        return
+    span = _otel_trace.get_current_span()
+    if span is not None and span.is_recording():
+        span.set_attribute(key, value)
 
 
 class ARCPipeline:
@@ -33,124 +43,93 @@ class ARCPipeline:
     """
 
     def __init__(self):
-        # Solver LM: DeepSeek-V4-Flash on GMI Cloud (reasoning=high set on the
-        # call below), matching the arc-agi seed so the two ARC arms differ in
-        # the benchmark and nothing else. The optimizer runs on DeepInfra
-        # GLM-5.2, so the GMI endpoint + key are passed explicitly here rather
-        # than relying on OPENAI_* env, which belongs to neither provider.
-        self.model = "openai/deepseek-ai/DeepSeek-V4-Flash"
-        self.api_base = "https://api.gmi-serving.com/v1"
-        self.api_key = os.environ.get("GMI_CLOUD_API_KEY") or os.environ.get("GMI_API_KEY")
+        # The benchmark's pinned model, served by a ranked list of providers:
+        # a provider error (or a hung connection) re-issues the identical
+        # request on the cover provider, and a sustained outage is skipped
+        # outright. Which provider serves a call is chosen by $LM_PROVIDER /
+        # $LM_FALLBACK, not here -- the model id, endpoint and key lookup live
+        # in the routing table, so none of them belongs in this file.
+        self.lm = build_task_lm()
 
-    # --- Hang guard -------------------------------------------------------
-    # GMI occasionally "hangs" a request: zero bytes until its gateway kills
-    # the connection at ~20 min. Measured on arc-agi at ~4.7% of rows, enough
-    # that nearly EVERY parallel eval walls at the straggler's timeout.
-    # Streaming makes hangs detectable: GMI streams reasoning deltas
-    # continuously (measured max inter-chunk gap ~3s), so READ_GAP_TIMEOUT_S of
-    # total silence is an unambiguous hang -> abort fast and retry instead of
-    # waiting for the gateway. httpx applies `timeout` per READ on a stream, so
-    # long generations are unaffected; TOTAL_BUDGET_S caps the row across all
-    # attempts.
-    READ_GAP_TIMEOUT_S = 240
-    TOTAL_BUDGET_S = 2400
-    MAX_ATTEMPTS = 2
-
-    def _complete(self, messages):
-        """Streaming completion with hang detection; returns content text."""
-        import time as _time
-
-        start = _time.monotonic()
-        last_err = None
-        for _attempt in range(self.MAX_ATTEMPTS):
-            if _time.monotonic() - start > self.TOTAL_BUDGET_S - self.READ_GAP_TIMEOUT_S:
-                break
-            try:
-                stream = litellm.completion(
-                    model=self.model,
-                    api_base=self.api_base,
-                    api_key=self.api_key,
-                    messages=messages,
-                    reasoning_effort="high",
-                    allowed_openai_params=["reasoning_effort"],
-                    stream=True,
-                    # Per-read gap cap on a stream (NOT total duration): only
-                    # trips when the connection goes fully silent (real hang).
-                    timeout=self.READ_GAP_TIMEOUT_S,
-                )
-                parts = []
-                for chunk in stream:
-                    if _time.monotonic() - start > self.TOTAL_BUDGET_S:
-                        raise TimeoutError(
-                            f"row exceeded total budget {self.TOTAL_BUDGET_S}s"
-                        )
-                    if chunk.choices:
-                        delta = chunk.choices[0].delta
-                        if delta is not None and getattr(delta, "content", None):
-                            parts.append(delta.content)
-                return "".join(parts)
-            except Exception as exc:  # noqa: BLE001 — hang/gap/transient
-                last_err = exc
-        raise last_err if last_err else RuntimeError("completion failed")
-
+    @traceable("chain")
     def __call__(self, train: list = None, test: list = None, task_id: str = "unknown", **kwargs) -> list:
-        with tracer.start_as_current_span("arc_predict") as span:
-            span.set_attribute("task_id", task_id)
+        train_cases = train or []
+        test_cases = test or []
 
-            train_cases = train or []
-            test_cases = test or []
+        outputs = []
+        for i, test_case in enumerate(test_cases):
+            outputs.append(self._solve_case(train_cases, test_case.get("input", []), i))
+        return outputs
 
-            prompt = (
-                "You are an expert at abstraction and reasoning. You will be given a few "
-                "demonstration pairs of input and output grids. Deduce the abstract "
-                "transformation rule that maps each input to its output, then apply that same "
-                "rule to the final test input grid.\n\n"
-            )
+    @traceable("function")
+    def _solve_case(self, train: list, test_input: list, case_index: int) -> list:
+        """Solve one test input. Falls back to echoing the input on any failure."""
+        prompt = self._build_prompt(train, test_input)
+        try:
+            content = self._call_llm(prompt)
+            return self._parse_grid(content)
+        except Exception as exc:
+            # Recorded as metadata rather than ce.error: the fallback is a
+            # deliberate, successful return, but the architect still needs to
+            # know this row never produced a real prediction.
+            _set_span_attr("fallback_reason", f"{type(exc).__name__}: {exc}")
+            return test_input
 
-            prompt += "Demonstrations:\n"
-            for i, case in enumerate(train_cases):
-                prompt += f"Pair {i + 1}:\n"
-                prompt += f"Input: {json.dumps(case.get('input'))}\n"
-                prompt += f"Output: {json.dumps(case.get('output'))}\n\n"
+    def _build_prompt(self, train_cases: list, test_input: list) -> str:
+        """Not traced: its output is the prompt, which is already the input of
+        the `_call_llm` span. A span here would duplicate that payload."""
+        prompt = (
+            "You are an expert at abstraction and reasoning. You will be given a few "
+            "demonstration pairs of input and output grids. Deduce the abstract "
+            "transformation rule that maps each input to its output, then apply that same "
+            "rule to the final test input grid.\n\n"
+        )
 
-            outputs = []
-            for test_case in test_cases:
-                test_input = test_case.get("input", [])
+        prompt += "Demonstrations:\n"
+        for i, case in enumerate(train_cases):
+            prompt += f"Pair {i + 1}:\n"
+            prompt += f"Input: {json.dumps(case.get('input'))}\n"
+            prompt += f"Output: {json.dumps(case.get('output'))}\n\n"
 
-                test_prompt = prompt + f"Test Case:\nInput: {json.dumps(test_input)}\n\n"
-                test_prompt += (
-                    "Output ONLY a valid JSON array of arrays (the output grid) and nothing "
-                    "else. No markdown, no explanation."
-                )
+        prompt += f"Test Case:\nInput: {json.dumps(test_input)}\n\n"
+        prompt += (
+            "Output ONLY a valid JSON array of arrays (the output grid) and nothing "
+            "else. No markdown, no explanation."
+        )
+        return prompt
 
-                try:
-                    content = self._complete(
-                        [{"role": "user", "content": test_prompt}]
-                    ).strip()
+    @traceable("llm")
+    def _call_llm(self, prompt: str) -> str:
+        """One task-LM call, on whichever provider is serving this run.
 
-                    # Strip any <think>...</think> block defensively: a
-                    # reasoning model that leaks its scratchpad into content
-                    # would otherwise fail the JSON parse and score a false 0.
-                    import re
-                    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        The request is streamed and guarded against a hung provider, and a
+        provider error is re-issued on the cover -- all inside `self.lm`, so any
+        LLM call added to this program inherits that simply by going through it.
+        """
+        return self.lm.completion([{"role": "user", "content": prompt}]).strip()
 
-                    if content.startswith("```json"):
-                        content = content.split("```json")[1]
-                    if content.startswith("```"):
-                        content = content.split("```")[1]
-                    if content.endswith("```"):
-                        content = content.rsplit("```", 1)[0]
+    @traceable("tool")
+    def _parse_grid(self, content: str) -> list:
+        """Strip reasoning leakage and markdown fencing, then decode the grid.
 
-                    content = content.strip()
-                    prediction = json.loads(content)
+        Raises on malformed output so the failure shows up as `ce.error` on this
+        span -- that is how the architect tells a bad parse apart from a bad
+        answer.
+        """
+        # A reasoning model that leaks its scratchpad into `content` would
+        # otherwise fail the JSON parse and score a false 0.
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
-                    if isinstance(prediction, list) and all(isinstance(row, list) for row in prediction):
-                        outputs.append(prediction)
-                    else:
-                        outputs.append(test_input)  # Fallback
-                except Exception as e:
-                    print(f"Error calling LLM or parsing response: {e}")
-                    outputs.append(test_input)  # Fallback on error
+        if content.startswith("```json"):
+            content = content.split("```json")[1]
+        if content.startswith("```"):
+            content = content.split("```")[1]
+        if content.endswith("```"):
+            content = content.rsplit("```", 1)[0]
 
-            span.set_attribute("num_predictions", len(outputs))
-            return outputs
+        content = content.strip()
+        prediction = json.loads(content)
+
+        if not (isinstance(prediction, list) and all(isinstance(row, list) for row in prediction)):
+            raise ValueError(f"model output is not a list of lists: {type(prediction).__name__}")
+        return prediction
