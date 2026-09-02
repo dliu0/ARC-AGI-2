@@ -238,15 +238,15 @@ def test_default_fallback_is_derived_from_the_preference_order():
         assert DEFAULT_FALLBACK[provider] == nxt
 
 
-def test_default_provider_is_in_the_preference_order():
-    assert DEFAULT_PROVIDER in PROVIDER_PREFERENCE
+def test_default_provider_is_the_head_of_the_preference_order():
+    assert DEFAULT_PROVIDER == PROVIDER_PREFERENCE[0] == "gmi"
 
 
-def test_unconfigured_run_is_deepseek_covered_by_deepinfra():
+def test_unconfigured_run_is_gmi_covered_by_deepseek():
     lm = build_task_lm()
-    assert (lm.provider, lm.fallback_provider) == ("deepseek", "deepinfra")
-    assert lm.model == DEEPSEEK_MODEL
-    assert lm.fallback_model == DEEPINFRA_MODEL
+    assert (lm.provider, lm.fallback_provider) == ("gmi", "deepseek")
+    assert lm.model == GMI_MODEL
+    assert lm.fallback_model == DEEPSEEK_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +298,11 @@ def test_lm_fallback_on_uses_the_next_provider(monkeypatch, value):
 
 
 def test_lm_fallback_can_name_a_provider(monkeypatch):
-    monkeypatch.setenv("LM_FALLBACK", "gmi")
+    """Any provider but the primary: the default cover is deepseek, so naming
+    deepinfra is what proves the env var is read rather than derived."""
+    monkeypatch.setenv("LM_FALLBACK", "deepinfra")
     lm = build_task_lm()
-    assert lm.fallback_provider == "gmi"
+    assert lm.fallback_provider == "deepinfra"
 
 
 def test_a_provider_cannot_cover_for_itself(monkeypatch):
@@ -371,15 +373,15 @@ def test_reasoning_is_enabled_on_both_routes():
 
 
 def test_happy_path_never_touches_the_cover(providers):
-    fake = providers(deepseek="all good")
+    fake = providers(gmi="all good")
     lm = build_task_lm()
     assert lm.completion(MESSAGES) == "all good"
-    assert fake.models == [DEEPSEEK_MODEL]
+    assert fake.models == [GMI_MODEL]
 
 
 def test_streamed_chunks_are_joined(providers):
     """The reply is assembled from deltas, not from a single response body."""
-    fake = providers(deepseek="a b c  d\ne")
+    fake = providers(gmi="a b c  d\ne")
     assert build_task_lm().completion(MESSAGES) == "a b c  d\ne"
     assert len(fake.calls) == 1
 
@@ -397,14 +399,14 @@ def test_empty_and_contentless_chunks_are_skipped(monkeypatch):
 
 
 def test_provider_error_diverts_to_the_cover(providers):
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    fake = providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm()
     assert lm.completion(MESSAGES) == "covered"
-    assert fake.models == [DEEPSEEK_MODEL, DEEPINFRA_MODEL]
+    assert fake.models == [GMI_MODEL, DEEPSEEK_MODEL]
 
 
 def test_the_cover_receives_the_identical_request(providers):
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    fake = providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm(temperature=0.25)
     lm.completion(MESSAGES, max_tokens=77)
 
@@ -417,18 +419,18 @@ def test_the_cover_receives_the_identical_request(providers):
 @pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 422, 429, 500, 503])
 def test_every_api_status_diverts(providers, status):
     fake = providers(
-        deepseek=api_error(status_code=status, model=DEEPSEEK_MODEL), deepinfra="covered"
+        gmi=api_error(status_code=status, model=GMI_MODEL), deepseek="covered"
     )
     assert build_task_lm().completion(MESSAGES) == "covered"
-    assert fake.models == [DEEPSEEK_MODEL, DEEPINFRA_MODEL]
+    assert fake.models == [GMI_MODEL, DEEPSEEK_MODEL]
 
 
 def test_connection_error_diverts(providers):
     fake = providers(
-        deepseek=litellm.APIConnectionError(
-            message="conn reset", llm_provider="deepseek", model=DEEPSEEK_MODEL
+        gmi=litellm.APIConnectionError(
+            message="conn reset", llm_provider="openai", model=GMI_MODEL
         ),
-        deepinfra="covered",
+        deepseek="covered",
     )
     assert build_task_lm().completion(MESSAGES) == "covered"
 
@@ -436,19 +438,19 @@ def test_connection_error_diverts(providers):
 def test_context_window_error_is_the_programs_own_fault(providers):
     """C4: the same prompt would not fit on the cover either."""
     exc = litellm.ContextWindowExceededError(
-        message="too long", model=DEEPSEEK_MODEL, llm_provider="deepseek"
+        message="too long", model=GMI_MODEL, llm_provider="openai"
     )
-    fake = providers(deepseek=exc, deepinfra="covered")
+    fake = providers(gmi=exc, deepseek="covered")
     with pytest.raises(litellm.ContextWindowExceededError):
         build_task_lm().completion(MESSAGES)
-    assert fake.models == [DEEPSEEK_MODEL]  # never diverted
+    assert fake.models == [GMI_MODEL]  # never diverted
 
 
 def test_program_exceptions_are_never_diverted(providers):
-    fake = providers(deepseek=ValueError("program bug"), deepinfra="covered")
+    fake = providers(gmi=ValueError("program bug"), deepseek="covered")
     with pytest.raises(ValueError, match="program bug"):
         build_task_lm().completion(MESSAGES)
-    assert fake.models == [DEEPSEEK_MODEL]
+    assert fake.models == [GMI_MODEL]
 
 
 def test_should_fallback_classification():
@@ -468,8 +470,8 @@ def test_should_fallback_classification():
 
 def test_both_providers_failing_raises_the_covers_error(providers):
     providers(
-        deepseek=api_error(status_code=402, model=DEEPSEEK_MODEL),
-        deepinfra=api_error(status_code=500, model=DEEPINFRA_MODEL),
+        gmi=api_error(status_code=402, model=GMI_MODEL),
+        deepseek=api_error(status_code=500, model=DEEPSEEK_MODEL),
     )
     with pytest.raises(litellm.APIError) as caught:
         build_task_lm().completion(MESSAGES)
@@ -479,19 +481,19 @@ def test_both_providers_failing_raises_the_covers_error(providers):
 
 def test_uncovered_errors_propagate(monkeypatch, providers):
     monkeypatch.setenv("LM_FALLBACK", "0")
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL))
+    fake = providers(gmi=api_error(model=GMI_MODEL))
     with pytest.raises(litellm.APIError):
         build_task_lm().completion(MESSAGES)
-    assert fake.models == [DEEPSEEK_MODEL]
+    assert fake.models == [GMI_MODEL]
 
 
 def test_divert_is_logged_and_visible(providers, capsys):
-    providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     build_task_lm().completion(MESSAGES)
     err = capsys.readouterr().err
-    assert f"[WARNING] deepseek error on {DEEPSEEK_MODEL} (status=402" in err
-    assert "retrying this call on deepinfra" in err
-    assert "deepinfra fallback succeeded" in err
+    assert f"[WARNING] gmi error on {GMI_MODEL} (status=402" in err
+    assert "retrying this call on deepseek" in err
+    assert "deepseek fallback succeeded" in err
 
 
 # ---------------------------------------------------------------------------
@@ -500,14 +502,14 @@ def test_divert_is_logged_and_visible(providers, capsys):
 
 
 def test_a_hang_is_retried_on_the_same_route_then_diverted(providers):
-    fake = providers(deepseek=HANG, deepinfra="covered")
+    fake = providers(gmi=HANG, deepseek="covered")
     assert build_task_lm().completion(MESSAGES) == "covered"
     # MAX_ATTEMPTS on the primary, then the cover.
-    assert fake.models == [DEEPSEEK_MODEL] * MAX_ATTEMPTS + [DEEPINFRA_MODEL]
+    assert fake.models == [GMI_MODEL] * MAX_ATTEMPTS + [DEEPSEEK_MODEL]
 
 
 def test_a_hang_counts_against_provider_health(providers):
-    providers(deepseek=HANG, deepinfra="covered")
+    providers(gmi=HANG, deepseek="covered")
     lm = build_task_lm()
     for _ in range(BREAKER_FAILURES):
         lm.completion(MESSAGES)
@@ -516,13 +518,13 @@ def test_a_hang_counts_against_provider_health(providers):
 
 def test_an_api_error_is_not_retried_on_the_same_route(providers):
     """LiteLLM's own num_retries already covered the transient statuses."""
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    fake = providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     build_task_lm().completion(MESSAGES)
-    assert fake.models.count(DEEPSEEK_MODEL) == 1
+    assert fake.models.count(GMI_MODEL) == 1
 
 
 def test_read_gap_timeout_is_passed_per_request(providers):
-    fake = providers(deepseek="ok")
+    fake = providers(gmi="ok")
     build_task_lm(read_gap_timeout=17).completion(MESSAGES)
     assert fake.calls[0]["timeout"] == 17
     assert fake.calls[0]["stream"] is True
@@ -530,7 +532,7 @@ def test_read_gap_timeout_is_passed_per_request(providers):
 
 def test_budget_exhaustion_is_not_diverted(providers):
     """C4-adjacent: with the row's budget gone there is nowhere useful to go."""
-    fake = providers(deepseek=HANG, deepinfra="covered")
+    fake = providers(gmi=HANG, deepseek="covered")
     lm = build_task_lm(total_budget=0)
     with pytest.raises(BudgetExceeded):
         lm.completion(MESSAGES)
@@ -544,9 +546,9 @@ def test_budget_exceeded_is_not_an_api_error():
 
 
 def test_max_attempts_is_configurable(providers):
-    fake = providers(deepseek=HANG, deepinfra="covered")
+    fake = providers(gmi=HANG, deepseek="covered")
     build_task_lm(max_attempts=1).completion(MESSAGES)
-    assert fake.models == [DEEPSEEK_MODEL, DEEPINFRA_MODEL]
+    assert fake.models == [GMI_MODEL, DEEPSEEK_MODEL]
 
 
 # ---------------------------------------------------------------------------
@@ -621,17 +623,17 @@ def test_a_failed_probe_restarts_the_cooldown():
 
 def test_breakers_are_process_global_not_per_lm():
     a, b = build_task_lm(), build_task_lm()
-    assert a.breaker is b.breaker is breaker_for("deepseek")
+    assert a.breaker is b.breaker is breaker_for("gmi")
 
 
 def test_reset_breakers_forgets_health():
-    first = breaker_for("deepseek")
+    first = breaker_for("gmi")
     reset_breakers()
-    assert breaker_for("deepseek") is not first
+    assert breaker_for("gmi") is not first
 
 
 def test_an_open_breaker_stops_paying_the_primary(providers):
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    fake = providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm()
 
     for _ in range(BREAKER_FAILURES):
@@ -641,11 +643,11 @@ def test_an_open_breaker_stops_paying_the_primary(providers):
     fake.calls.clear()
     for _ in range(25):
         assert lm.completion(MESSAGES) == "covered"
-    assert fake.models == [DEEPINFRA_MODEL] * 25  # zero primary attempts
+    assert fake.models == [DEEPSEEK_MODEL] * 25  # zero primary attempts
 
 
 def test_a_skipped_primary_still_answers_from_the_cover(providers):
-    providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm()
     for _ in range(BREAKER_FAILURES):
         lm.completion(MESSAGES)
@@ -653,14 +655,14 @@ def test_a_skipped_primary_still_answers_from_the_cover(providers):
 
 
 def test_success_resets_the_failure_count_end_to_end(providers):
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    fake = providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm()
     lm.completion(MESSAGES)
     lm.completion(MESSAGES)
-    fake.behaviour[DEEPSEEK_MODEL] = "recovered"
+    fake.behaviour[GMI_MODEL] = "recovered"
     assert lm.completion(MESSAGES) == "recovered"
 
-    fake.behaviour[DEEPSEEK_MODEL] = api_error(model=DEEPSEEK_MODEL)
+    fake.behaviour[GMI_MODEL] = api_error(model=GMI_MODEL)
     lm.completion(MESSAGES)
     lm.completion(MESSAGES)
     assert lm.breaker.state == "closed"  # count restarted after the success
@@ -668,12 +670,12 @@ def test_success_resets_the_failure_count_end_to_end(providers):
 
 def test_breaker_can_be_disabled(monkeypatch, providers):
     monkeypatch.setenv("LM_BREAKER", "0")
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    fake = providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm()
     assert lm.breaker is None
     for _ in range(6):
         lm.completion(MESSAGES)
-    assert fake.models.count(DEEPSEEK_MODEL) == 6  # every call re-tried the primary
+    assert fake.models.count(GMI_MODEL) == 6  # every call re-tried the primary
 
 
 def test_breaker_is_inert_without_a_cover(monkeypatch):
@@ -682,7 +684,7 @@ def test_breaker_is_inert_without_a_cover(monkeypatch):
 
 
 def test_breaker_state_is_shared_across_threads(providers):
-    fake = providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    fake = providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm()
     errors = []
 
@@ -702,12 +704,12 @@ def test_breaker_state_is_shared_across_threads(providers):
     assert errors == []
     assert lm.breaker.state == "open"
     # 80 calls, but the primary was attempted only while the breaker was closed.
-    assert fake.models.count(DEEPSEEK_MODEL) < 80
-    assert fake.models.count(DEEPINFRA_MODEL) >= 1
+    assert fake.models.count(GMI_MODEL) < 80
+    assert fake.models.count(DEEPSEEK_MODEL) >= 1
 
 
 def test_transitions_are_logged_once_not_per_call(providers, capsys):
-    providers(deepseek=api_error(model=DEEPSEEK_MODEL), deepinfra="covered")
+    providers(gmi=api_error(model=GMI_MODEL), deepseek="covered")
     lm = build_task_lm()
     for _ in range(BREAKER_FAILURES + 10):
         lm.completion(MESSAGES)

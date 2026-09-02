@@ -52,8 +52,8 @@ Which provider serves a call
 fastest of the three on the hover benchmark), then DeepSeek's own first-party
 API, then DeepInfra -- and that single ordering decides both who serves a call
 and who covers for whom: a provider's default fallback is the next one after it.
-``DEFAULT_PROVIDER`` pins the primary one step down the list while GMI's API is
-erroring, so an unconfigured run is DeepSeek primary with DeepInfra covering.
+``DEFAULT_PROVIDER`` is the head of that list, so an unconfigured run is GMI
+primary with DeepSeek covering.
 
 Cost of an outage (the circuit breaker)
 ---------------------------------------
@@ -96,7 +96,7 @@ Environment variables
                       ``TASK_MODEL``).
 ``LM_PROVIDER``       ``gmi``, ``deepseek`` or ``deepinfra`` -- which provider
                       serves the request first. Defaults to ``DEFAULT_PROVIDER``
-                      (``deepseek`` while GMI is down). Set it to route a whole
+                      (``gmi``). Set it to route a whole
                       run through one provider (e.g. an A/B of provider latency).
 ``LM_FALLBACK``       ``1``/``true``/``yes``/``on`` (default), ``0``/``false``/
                       ``no``/``off``/``none``, or the NAME of a provider. Whether
@@ -241,18 +241,24 @@ _ALLOWED_OPENAI_PARAMS = ["reasoning_effort"]
 PROVIDER_PREFERENCE = ("gmi", "deepseek", "deepinfra")
 PROVIDERS = PROVIDER_PREFERENCE
 
-# The primary when $LM_PROVIDER is unset. Normally ``PROVIDER_PREFERENCE[0]``,
-# but GMI's API is erroring on every call as of 2026-09-02, so runs start one
-# step down the order. Set this back to ``PROVIDER_PREFERENCE[0]`` once GMI is
-# healthy -- that alone restores GMI primary with DeepSeek covering, because the
-# fallbacks below follow the same ordering.
-DEFAULT_PROVIDER = "deepseek"
+# The primary when $LM_PROVIDER is unset: the head of the preference order, so
+# the default run is GMI primary with DeepSeek covering -- the fallbacks below
+# follow the same ordering, so this one name decides both.
+#
+# It was pinned one step down to "deepseek" on 2026-09-02, while GMI's account
+# answered every call with 402 "Insufficient balance". GMI billing was fixed and
+# the endpoint re-smoke-tested the same day (a completion with and without
+# `response_format={"type":"json_object"}`, both served), so the pin is lifted.
+# To demote a provider again, either name another member of PROVIDER_PREFERENCE
+# here -- which needs the seed bundle and image rebuilt -- or set $LM_PROVIDER
+# for one run, which does not.
+DEFAULT_PROVIDER = PROVIDER_PREFERENCE[0]
 
 PROVIDER_ENV_VAR = "LM_PROVIDER"
 FALLBACK_ENV_VAR = "LM_FALLBACK"
 # Who covers for whom when LM_FALLBACK is on but does not name a provider: the
-# next provider down the preference order, wrapping at the end. So GMI diverts
-# to DeepSeek, DeepSeek (today's primary) to DeepInfra.
+# next provider down the preference order, wrapping at the end. So GMI (today's
+# primary) diverts to DeepSeek, and DeepSeek to DeepInfra.
 DEFAULT_FALLBACK = {
     provider: PROVIDER_PREFERENCE[(i + 1) % len(PROVIDER_PREFERENCE)]
     for i, provider in enumerate(PROVIDER_PREFERENCE)
@@ -607,7 +613,7 @@ class ProviderFallbackLM:
     ``completion(messages)`` is the whole surface: it streams the reply, watches
     for a hang, and returns the assistant text. ``model`` / ``provider`` /
     ``fallback`` / ``breaker`` default to ``$LM_MODEL``, ``$LM_PROVIDER``,
-    ``$LM_FALLBACK`` and ``$LM_BREAKER`` -- today DeepSeek primary, DeepInfra
+    ``$LM_FALLBACK`` and ``$LM_BREAKER`` -- today GMI primary, DeepSeek
     covering, health flag armed. With ``fallback=False`` no cover route is
     built, the breaker is inert and errors propagate.
 
